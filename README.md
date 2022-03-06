@@ -1,4 +1,4 @@
-# starter-kit
+# offer 
 
 The NP starter kit describes how to launch a NP RApp in minutes. Quickstart assumes that the local development environment for Reach has been setup.
 
@@ -6,7 +6,7 @@ The NP starter kit describes how to launch a NP RApp in minutes. Quickstart assu
 
 commands
 ```bash
-git clone git@github.com:nash-protocol/starter-kit.git 
+git clone git@github.com:ZestBloom/offer.git 
 cd starter-kit 
 source np.sh 
 np

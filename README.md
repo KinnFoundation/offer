@@ -1,6 +1,6 @@
 # offer 
 
-The NP starter kit describes how to launch a NP RApp in minutes. Quickstart assumes that the local development environment for Reach has been setup.
+Offers offers any holder x amt of ALGO for a amount of token b.
 
 ## quickstart
 

@@ -5,7 +5,7 @@
 // Description: Simple Offer Reach App
 // Author: Nicholas Shellabarger
 // Version: 1.1.0 - add offer target and ttl
-// Requires Reach v0.1.11-rc7 or later
+// Requires Reach v0.1.11-rc7 (27cb9643) or later
 // ----------------------------------------------
 
 // CONSTS

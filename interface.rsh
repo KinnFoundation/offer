@@ -4,7 +4,7 @@
 // Name: Offer
 // Description: Simple Offer Reach App
 // Author: Nicholas Shellabarger
-// Version: 1.0.0 - offer initial
+// Version: 1.1.0 - add offer target and ttl
 // Requires Reach v0.1.11-rc7 or later
 // ----------------------------------------------
 
@@ -12,11 +12,13 @@
 
 const SERIAL_VER = 0; // serial version of reach app reserved to release identical contracts under a separate plana id
 
-const FEE_MIN_ACCEPT = 0;
-const FEE_MIN_CONSTRUCT = 0;
-const FEE_MIN_RELAY = 0;
+const FEE_MIN_ACCEPT = 6000;
+const FEE_MIN_CONSTRUCT = 4000;
+const FEE_MIN_RELAY = 5000;
+const FEE_MIN_TIMEOUT = 3000;
 
 export const Event = () => [];
+
 export const Participants = () => [
   Participant("Offerer", {
     getParams: Fun(
@@ -27,8 +29,10 @@ export const Participants = () => [
         acceptFee: UInt, // fee for accepting offer
         constructFee: UInt, // fee for construction
         relayFee: UInt, // fee for relaying
+        timeoutFee: UInt, // fee for timeout
         creator: Address, // address of creator
-        offerTtl: UInt, // timeout in seconds
+        offerEndTime: UInt, // timeout in seconds
+        offerTarget: Address, // address of offer target
       })
     ),
     signal: Fun([], Null),
@@ -41,16 +45,19 @@ const State = Tuple(
   /*token*/ Token,
   /*tokenAmount*/ UInt,
   /*offer*/ UInt,
+  /*counterOffer*/ UInt,
   /*closed*/ Bool,
   /*who*/ Address,
   /*creator*/ Address,
-  /*royaltyCents*/ UInt
+  /*royaltyCents*/ UInt,
+  /*offerEndTime*/ UInt
 );
 
 const STATE_OFFER = 3;
-const STATE_CLOSED = 4;
-const STATE_WHO = 5;
-const STATE_ROYAlTY_CENTS = 7;
+const STATE_COUNTER_OFFER = 4;
+const STATE_CLOSED = 5;
+const STATE_WHO = 6;
+const STATE_ROYAlTY_CENTS = 8;
 
 export const Views = () => [
   View({
@@ -61,7 +68,10 @@ export const Views = () => [
 export const Api = () => [
   API({
     getOffer: Fun([UInt], Null),
+    getTarget: Fun([Address], Null),
     acceptOffer: Fun([UInt], Null),
+    rejectOffer: Fun([], Null),
+    counterOffer: Fun([UInt], Null),
     cancel: Fun([], Null),
   }),
 ];
@@ -77,34 +87,51 @@ export const App = (map) => {
       acceptFee,
       constructFee,
       relayFee,
-      offerTtl,
+      timeoutFee,
+      offerEndTime,
+      offerTarget,
     } = declassify(interact.getParams());
   });
-
-  // Step 1
-
+  // Step
   Offerer.publish(
     tokenAmount,
     offer,
     acceptFee,
     constructFee,
     relayFee,
+    timeoutFee,
     creator,
-    offerTtl
+    offerEndTime,
+    offerTarget
   )
     .check(() => {
       check(offer > 0, "Offer must be greater than 0");
       check(tokenAmount > 0, "Token amount must be greater than 0");
-      check(acceptFee > FEE_MIN_ACCEPT, "Accept fee must be greater than 0");
       check(
-        constructFee > FEE_MIN_CONSTRUCT,
-        "Construct fee must be greater than 0"
+        acceptFee >= FEE_MIN_ACCEPT,
+        "Accept fee must be greater than minimum"
       );
-      check(relayFee > FEE_MIN_RELAY, "Relay fee must be greater than 0");
+      check(
+        constructFee >= FEE_MIN_CONSTRUCT,
+        "Construct fee must be greater than minimum"
+      );
+      check(
+        relayFee >= FEE_MIN_RELAY,
+        "Relay fee must be greater than minimum"
+      );
+      check(
+        timeoutFee >= FEE_MIN_TIMEOUT,
+        "Timeout fee must be greater than minimum"
+      );
     })
-    .pay([amt + offer + (constructFee + acceptFee + relayFee) + SERIAL_VER])
+    .pay([
+      amt +
+        offer +
+        (constructFee + acceptFee + relayFee + timeoutFee) +
+        SERIAL_VER,
+    ])
     .timeout(relativeTime(ttl), () => {
-      // Step 2
+      // Step
       Anybody.publish();
       commit();
       exit();
@@ -118,31 +145,34 @@ export const App = (map) => {
     /*token*/ token,
     /*tokenAmount*/ tokenAmount,
     /*offer*/ offer,
+    /*counterOffer*/ 0,
     /*closed*/ false,
-    /*who*/ Offerer,
+    /*who*/ offerTarget,
     /*creator*/ creator,
     /*royalty*/ 0,
+    /*offerTtl*/ offerEndTime,
   ];
-
-  // Step 5
-
+  // Step
   const [state, who] = parallelReduce([initialState, Offerer])
     .define(() => {
       v.state.set(state);
     })
     .invariant(balance(token) == 0, "token balance accurate")
     .invariant(
-      implies(!state[STATE_CLOSED], balance() == state[STATE_OFFER] + acceptFee + relayFee),
+      implies(
+        !state[STATE_CLOSED],
+        balance() == state[STATE_OFFER] + acceptFee + relayFee + timeoutFee
+      ),
       "balance accurate before closed"
     )
     .invariant(
-      implies(state[STATE_CLOSED], balance() == relayFee),
+      implies(state[STATE_CLOSED], balance() == relayFee + timeoutFee),
       "balance accurate after closed"
     )
     .while(!state[STATE_CLOSED])
     .paySpec([token])
     // API get offer
-    // - allow manager to upgrade offer
+    // - allow manager to upgrade offer amount
     .api_(a.getOffer, (msg) => {
       check(this === Offerer, "Offer must be made by Offerer");
       check(msg > 0, "Offer must be greater than 0");
@@ -154,11 +184,30 @@ export const App = (map) => {
         },
       ];
     })
+    // API get target
+    // - allow manager to update offer target
+    .api_(a.getTarget, (msg) => {
+      check(this === Offerer, "Offer target must be modified by Offerer");
+      return [
+        [0, [0, token]],
+        (k) => {
+          k(null);
+          return [
+            Tuple.set(Tuple.set(state, STATE_WHO, msg), STATE_COUNTER_OFFER, 0),
+            who,
+          ];
+        },
+      ];
+    })
     // API accept offer
     // - allow token holder to accept offer
     .api_(a.acceptOffer, (msg) => {
       check(msg >= 0, "Royalty must be greater than or equal to 0");
       check(msg <= 99, "Royalty must be less than or equal to 99");
+      check(
+        state[STATE_WHO] == Offerer || state[STATE_WHO] === this,
+        "Offer must be accepted by offer target"
+      );
       return [
         [0, [tokenAmount, token]],
         (k) => {
@@ -174,12 +223,46 @@ export const App = (map) => {
           transfer([[tokenAmount, token]]).to(Offerer);
           return [
             Tuple.set(
-              Tuple.set(state, STATE_CLOSED, true),
+              Tuple.set(state, STATE_CLOSED, true), // closes
               STATE_ROYAlTY_CENTS,
               msg
             ),
             this,
           ];
+        },
+      ];
+    })
+    // API reject
+    // - allow target to reject offer
+    // - rejector must reimburse offerer for activation costs
+    .api_(a.rejectOffer, () => {
+      check(this != Offerer, "Offer must not be rejected by oferer");
+      check(state[STATE_WHO] == this, "Offer must be rejected by offer target");
+      return [
+        [amt + constructFee + SERIAL_VER, [0, token]],
+        (k) => {
+          k(null);
+          transfer(
+            state[STATE_OFFER] + acceptFee + amt + constructFee + SERIAL_VER
+          ).to(Offerer);
+          return [Tuple.set(state, STATE_CLOSED, true), who]; // closes
+        },
+      ];
+    })
+    // API counter
+    // - allow target to counter offer
+    .api_(a.counterOffer, (msg) => {
+      check(this != Offerer, "Counter offer must not be made by offerer");
+      check(state[STATE_WHO] == this, "Counter offer must be made by target");
+      check(
+        msg > state[STATE_COUNTER_OFFER],
+        "Counter offer must be greater than previous offer"
+      );
+      return [
+        [0, [0, token]],
+        (k) => {
+          k(null);
+          return [Tuple.set(state, STATE_COUNTER_OFFER, msg), who];
         },
       ];
     })
@@ -192,35 +275,30 @@ export const App = (map) => {
           k(null);
           transfer(state[STATE_OFFER] + acceptFee).to(this);
           return [
-            Tuple.set(Tuple.set(state, STATE_CLOSED, true), STATE_OFFER, 0),
+            Tuple.set(Tuple.set(state, STATE_CLOSED, true), STATE_OFFER, 0), // closes
             this,
           ];
         },
       ];
     })
-    .timeout(false);
-  /*
     // allow offer ttl
-    .timeout(relativeTime(offerTtl), () => {
-      Relay.only(() => {
-        const rAddr = this;
-      });
-      Relay.publish(rAddr);
-      transfer(relayFee).to(rAddr);
-      transfer(state[STATE_OFFER]+acceptFee).to(Offerer);
-      return [state, who];
+    .timeout(absoluteTime(offerEndTime), () => {
+      // Step
+      Relay.publish();
+      transfer(state[STATE_OFFER] + acceptFee).to(Offerer);
+      return [
+        Tuple.set(Tuple.set(state, STATE_CLOSED, true), STATE_OFFER, 0), // closes
+        Offerer,
+      ];
     });
-    */
-   v.state.set(Tuple.set(state, STATE_WHO, who));
+  v.state.set(Tuple.set(state, STATE_WHO, who));
   commit();
   Relay.only(() => {
     const rAddr = this;
   });
-
-  // Step 4
-
+  // Step
   Relay.publish(rAddr); // Anybody can participate as the relay
-  transfer(relayFee).to(rAddr);
+  transfer(relayFee + timeoutFee).to(rAddr);
   commit();
   exit();
 };

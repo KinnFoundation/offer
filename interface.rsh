@@ -4,7 +4,7 @@
 // Name: Offer
 // Description: Simple Offer Reach App
 // Author: Nicholas Shellabarger
-// Version: 1.1.0 - add offer target and ttl
+// Version: 1.1.1 - use Struct/Object instead of Tuple
 // Requires Reach v0.1.11-rc7 (27cb9643) or later
 // ----------------------------------------------
 
@@ -17,47 +17,53 @@ const FEE_MIN_CONSTRUCT = 4000;
 const FEE_MIN_RELAY = 5000;
 const FEE_MIN_TIMEOUT = 3000;
 
+
+/*
+ * safePercent
+ * recommended way of calculating percent of a number
+ * where percentPrecision is like 10_000 and percentage is like 500, meaning 5%
+ */
+const safePercent = (amount, percentage, percentPrecision) =>
+  UInt(
+    (UInt256(amount) * UInt256(percentPrecision) * UInt256(percentage)) /
+      UInt256(percentPrecision)
+  );
+
 export const Event = () => [];
+
+const Params = Object({
+  tokenAmount: UInt, // token amount in case not dec0
+  offer: UInt, // initial offer amount
+  acceptFee: UInt, // fee for accepting offer
+  constructFee: UInt, // fee for construction
+  relayFee: UInt, // fee for relaying
+  timeoutFee: UInt, // fee for timeout
+  creator: Address, // address of creator
+  offerEndTime: UInt, // timeout in seconds
+  offerTarget: Address, // address of offer target
+});
 
 export const Participants = () => [
   Participant("Offerer", {
-    getParams: Fun(
-      [],
-      Object({
-        tokenAmount: UInt, // token amount in case not dec0
-        offer: UInt, // initial offer amount
-        acceptFee: UInt, // fee for accepting offer
-        constructFee: UInt, // fee for construction
-        relayFee: UInt, // fee for relaying
-        timeoutFee: UInt, // fee for timeout
-        creator: Address, // address of creator
-        offerEndTime: UInt, // timeout in seconds
-        offerTarget: Address, // address of offer target
-      })
-    ),
+    getParams: Fun([], Params),
     signal: Fun([], Null),
   }),
   ParticipantClass("Relay", {}),
 ];
 
-const State = Tuple(
-  /*manger*/ Address,
-  /*token*/ Token,
-  /*tokenAmount*/ UInt,
-  /*offer*/ UInt,
-  /*counterOffer*/ UInt,
-  /*closed*/ Bool,
-  /*who*/ Address,
-  /*creator*/ Address,
-  /*royaltyCents*/ UInt,
-  /*offerEndTime*/ UInt
-);
-
-const STATE_OFFER = 3;
-const STATE_COUNTER_OFFER = 4;
-const STATE_CLOSED = 5;
-const STATE_WHO = 6;
-const STATE_ROYAlTY_CENTS = 8;
+// TODO consider migrating Tuple to Object when it works in future version if there is nothing wrong with the code
+const State = Struct([
+  ["manager", Address],
+  ["token", Token],
+  ["tokenAmount", UInt],
+  ["offer", UInt],
+  ["counterOffer", UInt],
+  ["closed", Bool],
+  ["who", Address],
+  ["creator", Address],
+  ["royaltyCents", UInt],
+  ["offerEndTime", UInt],
+]);
 
 export const Views = () => [
   View({
@@ -140,36 +146,37 @@ export const App = (map) => {
 
   Offerer.interact.signal();
 
-  const initialState = [
-    /*manger*/ Offerer,
-    /*token*/ token,
-    /*tokenAmount*/ tokenAmount,
-    /*offer*/ offer,
-    /*counterOffer*/ 0,
-    /*closed*/ false,
-    /*who*/ offerTarget,
-    /*creator*/ creator,
-    /*royalty*/ 0,
-    /*offerTtl*/ offerEndTime,
-  ];
+  const initialState = {
+    manager: Offerer,
+    token,
+    tokenAmount,
+    offer,
+    counterOffer: 0,
+    closed: false,
+    who: Offerer,
+    creator,
+    royaltyCents: 0,
+    offerEndTime,
+  };
+
   // Step
-  const [state, who] = parallelReduce([initialState, Offerer])
+  const [state] = parallelReduce([initialState])
     .define(() => {
-      v.state.set(state);
+      v.state.set(State.fromObject(state));
     })
     .invariant(balance(token) == 0, "token balance accurate")
     .invariant(
       implies(
-        !state[STATE_CLOSED],
-        balance() == state[STATE_OFFER] + acceptFee + relayFee + timeoutFee
+        !state.closed,
+        balance() == state.offer + acceptFee + relayFee + timeoutFee
       ),
       "balance accurate before closed"
     )
     .invariant(
-      implies(state[STATE_CLOSED], balance() == relayFee + timeoutFee),
+      implies(state.closed, balance() == relayFee + timeoutFee),
       "balance accurate after closed"
     )
-    .while(!state[STATE_CLOSED])
+    .while(!state.closed)
     .paySpec([token])
     // API get offer
     // - allow manager to upgrade offer amount
@@ -180,7 +187,12 @@ export const App = (map) => {
         [msg, [0, token]],
         (k) => {
           k(null);
-          return [Tuple.set(state, STATE_OFFER, state[STATE_OFFER] + msg), who];
+          return [
+            {
+              ...state,
+              offer: state.offer + msg,
+            },
+          ];
         },
       ];
     })
@@ -193,8 +205,11 @@ export const App = (map) => {
         (k) => {
           k(null);
           return [
-            Tuple.set(Tuple.set(state, STATE_WHO, msg), STATE_COUNTER_OFFER, 0),
-            who,
+            {
+              ...state,
+              who: msg,
+              counterOffer: 0,
+            },
           ];
         },
       ];
@@ -205,29 +220,28 @@ export const App = (map) => {
       check(msg >= 0, "Royalty must be greater than or equal to 0");
       check(msg <= 99, "Royalty must be less than or equal to 99");
       check(
-        state[STATE_WHO] == Offerer || state[STATE_WHO] === this,
+        state.who == Offerer || state.who === this,
         "Offer must be accepted by offer target"
       );
       return [
         [0, [tokenAmount, token]],
         (k) => {
           k(null);
-          const cent = state[STATE_OFFER] / 100;
+          const cent = safePercent(state.offer, 1_000_000, 1_000); // 1%
           const platformAmount = cent;
           const royaltyAmount = msg * cent; // Royalties
-          const recvAmount =
-            state[STATE_OFFER] - (platformAmount + royaltyAmount);
+          const recvAmount = state.offer - (platformAmount + royaltyAmount);
           transfer(recvAmount + acceptFee).to(this);
           transfer(royaltyAmount).to(creator);
           transfer(platformAmount).to(addr);
-          transfer([[tokenAmount, token]]).to(Offerer);
+          transfer(tokenAmount, token).to(Offerer);
           return [
-            Tuple.set(
-              Tuple.set(state, STATE_CLOSED, true), // closes
-              STATE_ROYAlTY_CENTS,
-              msg
-            ),
-            this,
+            {
+              ...state,
+              closed: true,
+              royaltyCents: msg,
+              who: this,
+            },
           ];
         },
       ];
@@ -237,15 +251,20 @@ export const App = (map) => {
     // - rejector must reimburse offerer for activation costs
     .api_(a.rejectOffer, () => {
       check(this != Offerer, "Offer must not be rejected by oferer");
-      check(state[STATE_WHO] == this, "Offer must be rejected by offer target");
+      check(state.who == this, "Offer must be rejected by offer target");
       return [
         [amt + constructFee + SERIAL_VER, [0, token]],
         (k) => {
           k(null);
           transfer(
-            state[STATE_OFFER] + acceptFee + amt + constructFee + SERIAL_VER
+            state.offer + acceptFee + amt + constructFee + SERIAL_VER
           ).to(Offerer);
-          return [Tuple.set(state, STATE_CLOSED, true), who]; // closes
+          return [
+            {
+              ...state,
+              closed: true,
+            },
+          ];
         },
       ];
     })
@@ -253,16 +272,21 @@ export const App = (map) => {
     // - allow target to counter offer
     .api_(a.counterOffer, (msg) => {
       check(this != Offerer, "Counter offer must not be made by offerer");
-      check(state[STATE_WHO] == this, "Counter offer must be made by target");
+      check(state.who == this, "Counter offer must be made by target");
       check(
-        msg > state[STATE_COUNTER_OFFER],
+        msg > state.counterOffer,
         "Counter offer must be greater than previous offer"
       );
       return [
         [0, [0, token]],
         (k) => {
           k(null);
-          return [Tuple.set(state, STATE_COUNTER_OFFER, msg), who];
+          return [
+            {
+              ...state,
+              counterOffer: msg,
+            },
+          ];
         },
       ];
     })
@@ -273,10 +297,14 @@ export const App = (map) => {
       return [
         (k) => {
           k(null);
-          transfer(state[STATE_OFFER] + acceptFee).to(this);
+          transfer(state.offer + acceptFee).to(this);
           return [
-            Tuple.set(Tuple.set(state, STATE_CLOSED, true), STATE_OFFER, 0), // closes
-            this,
+            {
+              ...state,
+              closed: true,
+              offer: 0,
+              who: this,
+            },
           ];
         },
       ];
@@ -285,13 +313,16 @@ export const App = (map) => {
     .timeout(absoluteTime(offerEndTime), () => {
       // Step
       Relay.publish();
-      transfer(state[STATE_OFFER] + acceptFee).to(Offerer);
+      transfer(state.offer + acceptFee).to(Offerer);
       return [
-        Tuple.set(Tuple.set(state, STATE_CLOSED, true), STATE_OFFER, 0), // closes
-        Offerer,
+        {
+          ...state,
+          closed: true,
+          offer: 0,
+          who: Offerer,
+        },
       ];
     });
-  v.state.set(Tuple.set(state, STATE_WHO, who));
   commit();
   Relay.only(() => {
     const rAddr = this;

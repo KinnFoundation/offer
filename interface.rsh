@@ -1,141 +1,335 @@
 "reach 0.1";
 "use strict";
 // -----------------------------------------------
-// Name: Interface Template
-// Description: NP Rapp simple
+// Name: Offer
+// Description: Simple Offer Reach App
 // Author: Nicholas Shellabarger
-// Version: 0.1.0 - offer initial
-// Requires Reach v0.1.7 (stable)
+// Version: 1.1.1 - use Struct/Object instead of Tuple
+// Requires Reach v0.1.11-rc7 (27cb9643) or later
 // ----------------------------------------------
+
+// CONSTS
+
+const SERIAL_VER = 0; // serial version of reach app reserved to release identical contracts under a separate plana id
+
+const FEE_MIN_ACCEPT = 6000;
+const FEE_MIN_CONSTRUCT = 4000;
+const FEE_MIN_RELAY = 5000;
+const FEE_MIN_TIMEOUT = 3000;
+
+
+/*
+ * safePercent
+ * recommended way of calculating percent of a number
+ * where percentPrecision is like 10_000 and percentage is like 500, meaning 5%
+ */
+const safePercent = (amount, percentage, percentPrecision) =>
+  UInt(
+    (UInt256(amount) * UInt256(percentPrecision) * UInt256(percentage)) /
+      UInt256(percentPrecision)
+  );
+
+export const Event = () => [];
+
+const Params = Object({
+  tokenAmount: UInt, // token amount in case not dec0
+  offer: UInt, // initial offer amount
+  acceptFee: UInt, // fee for accepting offer
+  constructFee: UInt, // fee for construction
+  relayFee: UInt, // fee for relaying
+  timeoutFee: UInt, // fee for timeout
+  creator: Address, // address of creator
+  offerEndTime: UInt, // timeout in seconds
+  offerTarget: Address, // address of offer target
+});
+
 export const Participants = () => [
   Participant("Offerer", {
-    getParams: Fun(
-      [],
-      Object({
-        token: Token, // token id
-        tokenAmount: UInt, // token amount in case not dec0
-        offer: UInt, // initial offer amount
-      })
-    ),
+    getParams: Fun([], Params),
     signal: Fun([], Null),
   }),
-  Participant("Relay", {}),
+  ParticipantClass("Relay", {}),
 ];
+
+// TODO consider migrating Tuple to Object when it works in future version if there is nothing wrong with the code
+const State = Struct([
+  ["manager", Address],
+  ["token", Token],
+  ["tokenAmount", UInt],
+  ["offer", UInt],
+  ["counterOffer", UInt],
+  ["closed", Bool],
+  ["who", Address],
+  ["creator", Address],
+  ["royaltyCents", UInt],
+  ["offerEndTime", UInt],
+]);
+
 export const Views = () => [
   View({
-    token: Token,
-    highestBidder: Address,
-    currentPrice: UInt,
-    closed: Bool,
+    state: State,
   }),
 ];
+
 export const Api = () => [
   API({
     getOffer: Fun([UInt], Null),
+    getTarget: Fun([Address], Null),
     acceptOffer: Fun([UInt], Null),
-    retractOffer: Fun([], Null),
-    close: Fun([], Null),
+    rejectOffer: Fun([], Null),
+    counterOffer: Fun([UInt], Null),
+    cancel: Fun([], Null),
   }),
 ];
 export const App = (map) => {
-  const [
-    {
-      addr: creatorAddr, // address to send royalties
-      addr2: platformAddr, // address to send fees
-      amt: getOfferFee, // api fee i
-      amt2: acceptOfferFee, // api fee ii
-      amt3: retractOfferFee, // api fee iii
-      amt4: closeFee, // api fee iv
-    },
-    [Offerer, Relay],
-    [v],
-    [a],
-  ] = map;
+  const [{ amt, ttl, tok0: token }, [addr, _], [Offerer, Relay], [v], [a], _] =
+    map;
+
   Offerer.only(() => {
-    const { token, tokenAmount, offer } = declassify(interact.getParams());
-    assume(offer > 0);
-    assume(tokenAmount > 0);
+    const {
+      tokenAmount,
+      offer,
+      creator,
+      acceptFee,
+      constructFee,
+      relayFee,
+      timeoutFee,
+      offerEndTime,
+      offerTarget,
+    } = declassify(interact.getParams());
   });
-  Offerer.publish(token, tokenAmount, offer);
-  require(offer > 0);
-  require(tokenAmount > 0);
-  Offerer.only(() => interact.signal());
-  v.token.set(token);
-  const [keepGoing, highestBidder, currentPrice] = parallelReduce([
-    true,
-    Offerer,
+  // Step
+  Offerer.publish(
+    tokenAmount,
     offer,
-  ])
-    .define(() => {
-      v.highestBidder.set(highestBidder);
-      v.currentPrice.set(currentPrice);
+    acceptFee,
+    constructFee,
+    relayFee,
+    timeoutFee,
+    creator,
+    offerEndTime,
+    offerTarget
+  )
+    .check(() => {
+      check(offer > 0, "Offer must be greater than 0");
+      check(tokenAmount > 0, "Token amount must be greater than 0");
+      check(
+        acceptFee >= FEE_MIN_ACCEPT,
+        "Accept fee must be greater than minimum"
+      );
+      check(
+        constructFee >= FEE_MIN_CONSTRUCT,
+        "Construct fee must be greater than minimum"
+      );
+      check(
+        relayFee >= FEE_MIN_RELAY,
+        "Relay fee must be greater than minimum"
+      );
+      check(
+        timeoutFee >= FEE_MIN_TIMEOUT,
+        "Timeout fee must be greater than minimum"
+      );
     })
-    .invariant(balance() >= 0)
-    .while(keepGoing)
+    .pay([
+      amt +
+        offer +
+        (constructFee + acceptFee + relayFee + timeoutFee) +
+        SERIAL_VER,
+    ])
+    .timeout(relativeTime(ttl), () => {
+      // Step
+      Anybody.publish();
+      commit();
+      exit();
+    });
+  transfer(amt + constructFee + SERIAL_VER).to(addr);
+
+  Offerer.interact.signal();
+
+  const initialState = {
+    manager: Offerer,
+    token,
+    tokenAmount,
+    offer,
+    counterOffer: 0,
+    closed: false,
+    who: Offerer,
+    creator,
+    royaltyCents: 0,
+    offerEndTime,
+  };
+
+  // Step
+  const [state] = parallelReduce([initialState])
+    .define(() => {
+      v.state.set(State.fromObject(state));
+    })
+    .invariant(balance(token) == 0, "token balance accurate")
+    .invariant(
+      implies(
+        !state.closed,
+        balance() == state.offer + acceptFee + relayFee + timeoutFee
+      ),
+      "balance accurate before closed"
+    )
+    .invariant(
+      implies(state.closed, balance() == relayFee + timeoutFee),
+      "balance accurate after closed"
+    )
+    .while(!state.closed)
     .paySpec([token])
     // API get offer
-    // - allow offer upgrades
-    .api(
-      a.getOffer,
-      (msg) => assume(true && msg > currentPrice),
-      (msg) => [msg + getOfferFee, [tokenAmount, token]],
-      (msg, k) => {
-        require(true && msg > currentPrice);
-        transfer(currentPrice).to(highestBidder);
-        k(null);
-        return [true, this, msg];
-      }
-    )
+    // - allow manager to upgrade offer amount
+    .api_(a.getOffer, (msg) => {
+      check(this === Offerer, "Offer must be made by Offerer");
+      check(msg > 0, "Offer must be greater than 0");
+      return [
+        [msg, [0, token]],
+        (k) => {
+          k(null);
+          return [
+            {
+              ...state,
+              offer: state.offer + msg,
+            },
+          ];
+        },
+      ];
+    })
+    // API get target
+    // - allow manager to update offer target
+    .api_(a.getTarget, (msg) => {
+      check(this === Offerer, "Offer target must be modified by Offerer");
+      return [
+        [0, [0, token]],
+        (k) => {
+          k(null);
+          return [
+            {
+              ...state,
+              who: msg,
+              counterOffer: 0,
+            },
+          ];
+        },
+      ];
+    })
     // API accept offer
     // - allow token holder to accept offer
-    .api(
-      a.acceptOffer,
-      (msg) => assume(true && currentPrice > 0 && msg >= 0 && msg <= 99),
-      (_) => [acceptOfferFee, [tokenAmount, token]],
-      (msg, k) => {
-        require(true && currentPrice > 0 && msg >= 0 && msg <= 99);
-        k(null);
-        const cent = balance() / 100;
-        const platformAmount = cent;
-        const royaltyAmount = msg * cent; // Royalties
-        const recvAmount = balance() - (platformAmount + royaltyAmount);
-        transfer(recvAmount).to(this);
-        transfer(royaltyAmount).to(creatorAddr);
-        transfer([[balance(token), token]]).to(highestBidder);
-        return [false, highestBidder, currentPrice];
-      }
-    )
-    // API retract offer
-    // - the current offer holder can cancel
-    .api(
-      a.retractOffer,
-      () => assume(true && this == highestBidder && currentPrice > 0),
-      () => [retractOfferFee, [0, token]],
-      (k) => {
-        require(true && this == highestBidder && currentPrice > 0);
-        k(null);
-        transfer(balance()).to(highestBidder);
-        return [true, this, 0];
-      }
-    )
+    .api_(a.acceptOffer, (msg) => {
+      check(msg >= 0, "Royalty must be greater than or equal to 0");
+      check(msg <= 99, "Royalty must be less than or equal to 99");
+      check(
+        state.who == Offerer || state.who === this,
+        "Offer must be accepted by offer target"
+      );
+      return [
+        [0, [tokenAmount, token]],
+        (k) => {
+          k(null);
+          const cent = safePercent(state.offer, 1_000_000, 1_000); // 1%
+          const platformAmount = cent;
+          const royaltyAmount = msg * cent; // Royalties
+          const recvAmount = state.offer - (platformAmount + royaltyAmount);
+          transfer(recvAmount + acceptFee).to(this);
+          transfer(royaltyAmount).to(creator);
+          transfer(platformAmount).to(addr);
+          transfer(tokenAmount, token).to(Offerer);
+          return [
+            {
+              ...state,
+              closed: true,
+              royaltyCents: msg,
+              who: this,
+            },
+          ];
+        },
+      ];
+    })
+    // API reject
+    // - allow target to reject offer
+    // - rejector must reimburse offerer for activation costs
+    .api_(a.rejectOffer, () => {
+      check(this != Offerer, "Offer must not be rejected by oferer");
+      check(state.who == this, "Offer must be rejected by offer target");
+      return [
+        [amt + constructFee + SERIAL_VER, [0, token]],
+        (k) => {
+          k(null);
+          transfer(
+            state.offer + acceptFee + amt + constructFee + SERIAL_VER
+          ).to(Offerer);
+          return [
+            {
+              ...state,
+              closed: true,
+            },
+          ];
+        },
+      ];
+    })
+    // API counter
+    // - allow target to counter offer
+    .api_(a.counterOffer, (msg) => {
+      check(this != Offerer, "Counter offer must not be made by offerer");
+      check(state.who == this, "Counter offer must be made by target");
+      check(
+        msg > state.counterOffer,
+        "Counter offer must be greater than previous offer"
+      );
+      return [
+        [0, [0, token]],
+        (k) => {
+          k(null);
+          return [
+            {
+              ...state,
+              counterOffer: msg,
+            },
+          ];
+        },
+      ];
+    })
     // API close
-    // - anybody can close offer contract for 1 ALGO
-    .api(
-      a.close,
-      () => assume(true && currentPrice == 0),
-      () => [closeFee, [0, token]], // discourage meddling
-      (k) => {
-        require(true && currentPrice == 0);
-        k(null);
-        return [false, this, 0];
-      }
-    )
-    .timeout(false);
-  v.closed.set(true); // Set View Closed
+    // - manager can close offer contract
+    .api_(a.cancel, () => {
+      check(this == Offerer, "Offer may only be cancelled by Offerer");
+      return [
+        (k) => {
+          k(null);
+          transfer(state.offer + acceptFee).to(this);
+          return [
+            {
+              ...state,
+              closed: true,
+              offer: 0,
+              who: this,
+            },
+          ];
+        },
+      ];
+    })
+    // allow offer ttl
+    .timeout(absoluteTime(offerEndTime), () => {
+      // Step
+      Relay.publish();
+      transfer(state.offer + acceptFee).to(Offerer);
+      return [
+        {
+          ...state,
+          closed: true,
+          offer: 0,
+          who: Offerer,
+        },
+      ];
+    });
   commit();
-  Relay.publish(); // Anybody can participate as the relay
-  transfer(balance()).to(platformAddr);
-  transfer(balance(token), token).to(platformAddr);
+  Relay.only(() => {
+    const rAddr = this;
+  });
+  // Step
+  Relay.publish(rAddr); // Anybody can participate as the relay
+  transfer(relayFee + timeoutFee).to(rAddr);
   commit();
   exit();
 };

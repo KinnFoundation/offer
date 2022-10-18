@@ -4,7 +4,7 @@
 // Name: Offer
 // Description: Simple Offer Reach App
 // Author: Nicholas Shellabarger
-// Version: 1.1.2 - use base
+// Version: 1.2.0 - add app close evt
 // Requires Reach v0.1.11-rc7 (27cb9643) or later
 // ----------------------------------------------
 
@@ -84,13 +84,14 @@ export const api = {
 
 // CONTRACT
 
-export const Event = () => [Events({ appLaunch: [] })];
+export const Event = () => [Events({ appLaunch: [], appClose: [] })];
 
 export const Participants = () => [
   Participant("Manager", {
     getParams: Fun([], Params),
   }),
   Participant("Relay", {}),
+  Participant("Eve", {}),
 ];
 
 export const Views = () => [View(view(State))];
@@ -101,7 +102,7 @@ export const App = (map) => {
   const [
     { amt, ttl, tok0: token },
     [addr, _],
-    [Manager, Relay],
+    [Manager, Relay, _],
     [v],
     [a],
     [e],
@@ -296,6 +297,7 @@ export const App = (map) => {
         },
       ];
     });
+  e.appClose();
   commit();
   Relay.publish();
   commit();
